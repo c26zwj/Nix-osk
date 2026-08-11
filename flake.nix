@@ -13,11 +13,12 @@
             pname = "orbit-osk";
             version = "0.1.0";
             src = self;
-            nativeBuildInputs = [ pkgs.cmake pkgs.qt6.wrapQtAppsHook ];
+            nativeBuildInputs = [ pkgs.cmake pkgs.qt6.wrapQtAppsHook pkgs.makeWrapper ];
             buildInputs = [ pkgs.qt6.qtbase pkgs.kdePackages.layer-shell-qt pkgs.ydotool ];
             postFixup = ''
               wrapProgram $out/bin/orbit-osk \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ydotool ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ydotool ]} \
+                --set QT_QPA_PLATFORM xcb
             '';
           };
         });

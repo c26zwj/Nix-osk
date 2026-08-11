@@ -1,6 +1,8 @@
 #include <QApplication>
 #include <QColorDialog>
 #include <QCloseEvent>
+#include <QCheckBox>
+#include <QCursor>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -21,8 +23,11 @@
 #include <QSettings>
 #include <QShowEvent>
 #include <QSlider>
+#include <QSizeGrip>
 #include <QSpinBox>
 #include <QStyle>
+#include <QSystemTrayIcon>
+#include <QMenu>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -78,18 +83,41 @@ private:
 
 class ResizeGrip final : public QWidget {
 public:
-    explicit ResizeGrip(QWidget *parent, std::function<void(QPoint)> resizePanel)
-        : QWidget(parent), resizePanel_(std::move(resizePanel)) {
+    explicit ResizeGrip(QWidget *parent, std::function<void(QPoint)> resizePanel,
+                        bool systemResize = false,
+                        Qt::Edges edges = Qt::BottomEdge | Qt::RightEdge)
+        : QWidget(parent), resizePanel_(std::move(resizePanel)), systemResize_(systemResize), edges_(edges) {
         setFixedSize(18, 18);
-        setCursor(Qt::SizeFDiagCursor);
-        setStyleSheet("background: transparent;");
+        setCursor((edges_ == (Qt::TopEdge | Qt::LeftEdge) ||
+                   edges_ == (Qt::BottomEdge | Qt::RightEdge))
+                      ? Qt::SizeFDiagCursor : Qt::SizeBDiagCursor);
+        setToolTip("Drag to resize");
+        setStyleSheet("background: transparent; border: none;");
+        parent->installEventFilter(this);
     }
 
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override {
+        if (watched == parentWidget() &&
+            (event->type() == QEvent::Resize || event->type() == QEvent::Show)) {
+            const int s = width();
+            const int x = (edges_ & Qt::LeftEdge) ? 0 : parentWidget()->width() - s;
+            const int y = (edges_ & Qt::TopEdge) ? 0 : parentWidget()->height() - s;
+            move(x, y);
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
     void mousePressEvent(QMouseEvent *event) override {
         if (event->button() == Qt::LeftButton) {
+            if (systemResize_ && window()->windowHandle()) {
+                window()->windowHandle()->startSystemResize(Qt::BottomEdge | Qt::RightEdge);
+                event->accept();
+                return;
+            }
             start_ = event->globalPosition().toPoint();
             startSize_ = parentWidget()->size();
+            startPosition_ = parentWidget()->pos();
             dragging_ = true;
             event->accept();
         }
@@ -97,8 +125,18 @@ protected:
 
     void mouseMoveEvent(QMouseEvent *event) override {
         if (dragging_ && (event->buttons() & Qt::LeftButton)) {
-            resizePanel_(QPoint(startSize_.width(), startSize_.height()) +
-                         (event->globalPosition().toPoint() - start_));
+            const QPoint delta = event->globalPosition().toPoint() - start_;
+            QSize size = startSize_;
+            if (edges_ & Qt::LeftEdge) size.rwidth() -= delta.x();
+            if (edges_ & Qt::RightEdge) size.rwidth() += delta.x();
+            if (edges_ & Qt::TopEdge) size.rheight() -= delta.y();
+            if (edges_ & Qt::BottomEdge) size.rheight() += delta.y();
+            QPoint position = startPosition_;
+            if (edges_ & Qt::LeftEdge) position.rx() += delta.x();
+            if (edges_ & Qt::TopEdge) position.ry() += delta.y();
+            resizePanel_(QPoint(size.width(), size.height()));
+            if (edges_ & (Qt::LeftEdge | Qt::TopEdge))
+                parentWidget()->move(position);
             event->accept();
         }
     }
@@ -112,8 +150,11 @@ protected:
 
 private:
     std::function<void(QPoint)> resizePanel_;
+    bool systemResize_ = false;
     QPoint start_;
     QSize startSize_;
+    QPoint startPosition_;
+    Qt::Edges edges_;
     bool dragging_ = false;
 };
 
@@ -186,12 +227,12 @@ public:
     Keyboard() {
         setWindowTitle("Orbit Keyboard");
         setObjectName("keyboard");
-        setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint |
-                       Qt::WindowDoesNotAcceptFocus);
+        setWindowFlags(Qt::Window | Qt::WindowStaysOnTopHint |
+                       Qt::WindowDoesNotAcceptFocus | Qt::X11BypassWindowManagerHint);
         setAttribute(Qt::WA_ShowWithoutActivating, true);
         setAttribute(Qt::WA_X11DoNotAcceptFocus, true);
         setFocusPolicy(Qt::NoFocus);
-        setAttribute(Qt::WA_TranslucentBackground, true);
+        setAttribute(Qt::WA_TranslucentBackground, false);
         settings_.beginGroup("appearance");
         repeatDelay_ = settings_.value("repeatDelay", 450).toInt();
         repeatInterval_ = settings_.value("repeatInterval", 55).toInt();
@@ -200,6 +241,8 @@ public:
         opacity_ = settings_.value("opacity", 100).toInt();
         keyColor_ = settings_.value("keyColor", "#202c3d").toString();
         borderColor_ = settings_.value("borderColor", "#101722").toString();
+        keyLabelColor_ = settings_.value("keyLabelColor", "#eef2f7").toString();
+        hoverColor_ = settings_.value("hoverColor", "#3a506d").toString();
         settings_.endGroup();
 
         panel_ = new QWidget(this);
@@ -236,33 +279,59 @@ public:
         monitorButton->setToolTip("Move keyboard to next monitor");
         connect(monitorButton, &QPushButton::clicked, this, [this] {
             const auto screens = QGuiApplication::screens();
-            if (screens.size() < 2 || !layer_)
+            if (screens.size() < 2)
                 return;
-            QScreen *current = windowHandle()->screen();
+            QScreen *current = QGuiApplication::screenAt(frameGeometry().center());
+            if (!current)
+                current = QGuiApplication::primaryScreen();
             int index = screens.indexOf(current);
             QScreen *next = screens.at((index + 1) % screens.size());
-            hide();
-            windowHandle()->setScreen(next);
-            layer_->setWantsToBeOnActiveScreen(false);
-            layer_->setScreen(next);
-            QTimer::singleShot(50, this, [this] {
-                show();
-                raise();
-            });
-            QTimer::singleShot(200, this, [this] {
-                movePanel(QPoint((width() - panel_->width()) / 2,
-                                 height() - panel_->height()));
-            });
+            const QRect source = current->availableGeometry();
+            const QRect destination = next->availableGeometry();
+            const QPoint offset = frameGeometry().topLeft() - source.topLeft();
+            const int x = qBound(destination.left(), destination.left() + offset.x(),
+                                 destination.right() - width() + 1);
+            const int y = qBound(destination.top(), destination.top() + offset.y(),
+                                 destination.bottom() - height() + 1);
+            movePanel(QPoint(x, y));
+            raise();
         });
         topBar->addWidget(monitorButton);
+        auto *minimizeButton = new QPushButton("−", panel_);
+        minimizeButton->setObjectName("minimizeButton");
+        minimizeButton->setFocusPolicy(Qt::NoFocus);
+        minimizeButton->setFixedSize(22, 14);
+        minimizeButton->setToolTip("Minimize keyboard");
+        connect(minimizeButton, &QPushButton::clicked, this, &Keyboard::minimizeToTray);
+        topBar->addWidget(minimizeButton);
         auto *closeButton = new QPushButton("×", panel_);
         closeButton->setObjectName("closeButton");
         closeButton->setFocusPolicy(Qt::NoFocus);
         closeButton->setFixedSize(22, 14);
         closeButton->setToolTip("Close keyboard");
-        connect(closeButton, &QPushButton::clicked, this, &QWidget::close);
+        connect(closeButton, &QPushButton::clicked, qApp, &QApplication::quit);
         topBar->addWidget(closeButton);
+        auto *topBarSpacer = new QWidget(panel_);
+        topBarSpacer->setObjectName("topBarSpacer");
+        topBarSpacer->setFixedWidth(20);
+        topBar->addWidget(topBarSpacer);
         panelLayout->addLayout(topBar);
+
+        tray_ = new QSystemTrayIcon(QIcon::fromTheme("input-keyboard"), this);
+        auto *trayMenu = new QMenu;
+        auto *restoreAction = trayMenu->addAction("Restore keyboard");
+        trayMenu->addSeparator();
+        auto *quitAction = trayMenu->addAction("Quit");
+        tray_->setContextMenu(trayMenu);
+        connect(restoreAction, &QAction::triggered, this, [this] { restoreFromTray(); });
+        connect(quitAction, &QAction::triggered, qApp, &QApplication::quit);
+        connect(tray_, &QSystemTrayIcon::activated, this,
+                [this](QSystemTrayIcon::ActivationReason reason) {
+                    if (reason == QSystemTrayIcon::Trigger ||
+                        reason == QSystemTrayIcon::DoubleClick)
+                        restoreFromTray();
+                });
+        tray_->show();
 
         body_ = new QHBoxLayout;
         body_->setContentsMargins(0, 0, 0, 0);
@@ -297,55 +366,46 @@ public:
         body_->addWidget(sidePanel);
         panelLayout->addLayout(body_);
 
-        resizeGrip_ = new ResizeGrip(panel_, [this](QPoint delta) {
-            panel_->resize(qMax(panel_->minimumWidth(), delta.x()),
-                           qMax(panel_->minimumHeight(), delta.y()));
+        const auto resizePanel = [this](QPoint requestedSize) {
+            resize(qMax(minimumWidth(), requestedSize.x()),
+                   qMax(minimumHeight(), requestedSize.y()));
+            panel_->resize(size());
             panel_->layout()->activate();
-            resizeGrip_->move(panel_->width() - resizeGrip_->width(),
-                              panel_->height() - resizeGrip_->height());
-            movePanel(panel_->pos());
-        });
-        resizeGrip_->move(panel_->width() - resizeGrip_->width(),
-                          panel_->height() - resizeGrip_->height());
+        };
+        resizeGrips_.append(new ResizeGrip(this, resizePanel, false,
+                                           Qt::TopEdge | Qt::LeftEdge));
+        resizeGrips_.append(new ResizeGrip(this, resizePanel, false,
+                                           Qt::TopEdge | Qt::RightEdge));
+        resizeGrips_.append(new ResizeGrip(this, resizePanel, false,
+                                           Qt::BottomEdge | Qt::LeftEdge));
+        resizeGrips_.append(new ResizeGrip(this, resizePanel, false,
+                                           Qt::BottomEdge | Qt::RightEdge));
 
         buildKeys();
         applyStyle();
 
-        // QWidget creates its backing QWindow lazily. Materialize it before
-        // attaching the layer-shell role.
-        winId();
-        layer_ = LayerShellQt::Window::get(windowHandle());
-        layer_->setLayer(LayerShellQt::Window::LayerOverlay);
-        layer_->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
-        layer_->setActivateOnShow(false);
-        LayerShellQt::Window::Anchors anchors;
-        anchors.setFlag(LayerShellQt::Window::AnchorTop);
-        anchors.setFlag(LayerShellQt::Window::AnchorLeft);
-        anchors.setFlag(LayerShellQt::Window::AnchorRight);
-        anchors.setFlag(LayerShellQt::Window::AnchorBottom);
-        layer_->setAnchors(anchors);
-        layer_->setExclusiveZone(0);
-        layer_->setDesiredSize(QSize(0, 0));
+        resize(panel_->size());
+        panel_->move(0, 0);
+        setWindowState(Qt::WindowNoState);
+        showNormal();
+        resize(panel_->size());
+        if (restorePanelPosition_)
+            move(savedPanelPosition_);
+        else if (QScreen *screen = QGuiApplication::primaryScreen())
+            move(screen->geometry().center() - rect().center());
     }
 
 protected:
     void showEvent(QShowEvent *event) override {
         QWidget::showEvent(event);
-        QTimer::singleShot(150, this, [this] {
-            if (restorePanelPosition_)
-                movePanel(savedPanelPosition_);
-            else
-                movePanel(QPoint((width() - panel_->width()) / 2,
-                                 height() - panel_->height()));
-        });
     }
 
     void closeEvent(QCloseEvent *event) override {
         settings_.beginGroup("window");
         settings_.setValue("width", panel_->width());
         settings_.setValue("height", panel_->height());
-        settings_.setValue("x", panel_->x());
-        settings_.setValue("y", panel_->y());
+        settings_.setValue("x", x());
+        settings_.setValue("y", y());
         settings_.endGroup();
         settings_.sync();
         QWidget::closeEvent(event);
@@ -353,11 +413,15 @@ protected:
 
     void resizeEvent(QResizeEvent *event) override {
         QWidget::resizeEvent(event);
-        if (resizeGrip_)
-            resizeGrip_->move(panel_->width() - resizeGrip_->width(),
-                              panel_->height() - resizeGrip_->height());
         if (panel_)
-            setMask(QRegion(panel_->geometry()));
+            panel_->resize(size());
+        const int gripSize = resizeGrips_.isEmpty() ? 0 : resizeGrips_.first()->width();
+        if (resizeGrips_.size() == 4) {
+            resizeGrips_[0]->move(0, 0);
+            resizeGrips_[1]->move(width() - gripSize, 0);
+            resizeGrips_[2]->move(0, height() - gripSize);
+            resizeGrips_[3]->move(width() - gripSize, height() - gripSize);
+        }
     }
 
 private:
@@ -367,8 +431,9 @@ private:
     QVBoxLayout *sideKeys_{};
     QHBoxLayout *body_{};
     QWidget *panel_{};
-    ResizeGrip *resizeGrip_{};
+    QList<ResizeGrip *> resizeGrips_;
     QGraphicsOpacityEffect *opacityEffect_{};
+    QSystemTrayIcon *tray_{};
     LayerShellQt::Window *layer_{};
     QSettings settings_;
     int repeatDelay_ = 450;
@@ -378,6 +443,8 @@ private:
     int opacity_ = 100;
     QString keyColor_ = "#202c3d";
     QString borderColor_ = "#101722";
+    QString keyLabelColor_ = "#eef2f7";
+    QString hoverColor_ = "#3a506d";
     ModifierState shift_ = ModifierState::Off;
     ModifierState ctrl_ = ModifierState::Off;
     ModifierState alt_ = ModifierState::Off;
@@ -390,38 +457,33 @@ private:
     bool restorePanelPosition_ = false;
 
     void movePanel(QPoint position) {
-        position.setX(qBound(0, position.x(), qMax(0, width() - panel_->width())));
-        position.setY(qBound(0, position.y(), qMax(0, height() - panel_->height())));
-        panel_->move(position);
-        setMask(QRegion(panel_->geometry()));
+        move(position);
+        panel_->move(0, 0);
         settings_.beginGroup("window");
-        settings_.setValue("x", panel_->x());
-        settings_.setValue("y", panel_->y());
+        settings_.setValue("x", x());
+        settings_.setValue("y", y());
         settings_.endGroup();
+    }
+
+    void minimizeToTray() {
+        hide();
+        tray_->show();
+    }
+
+    void restoreFromTray() {
+        showNormal();
+        show();
+        raise();
     }
 
     void dragTo(const QPoint &pointer, bool begin) {
         if (begin) {
             dragPointerStart_ = pointer;
-            dragPanelStart_ = panel_->pos();
+            dragPanelStart_ = pos();
             return;
         }
-        if (layer_) {
-            if (QScreen *screen = QGuiApplication::screenAt(pointer);
-                screen && screen != windowHandle()->screen()) {
-                windowHandle()->setScreen(screen);
-                layer_->setWantsToBeOnActiveScreen(true);
-                QTimer::singleShot(0, this, [this] {
-                    movePanel(QPoint((width() - panel_->width()) / 2,
-                                     height() - panel_->height()));
-                });
-                dragPointerStart_ = pointer;
-                dragPanelStart_ = panel_->pos();
-                return;
-            }
-        }
         const QPoint delta = pointer - dragPointerStart_;
-        movePanel(dragPanelStart_ + delta);
+        move(dragPanelStart_ + delta);
     }
 
     QPushButton *key(const QString &label, const QString &action = {}, int width = 1,
@@ -483,6 +545,8 @@ private:
                 typePrintable(input, modifierActive("SHIFT"));
             });
         }
+        if (action == "TAB")
+            button->setRightClickAction([this] { sendChord("15", true); clearModifiers(); });
         if (action == "RETURN") {
             button->setRightClickAction([this] { pressShiftEnter(); });
         } else if (action.isEmpty()) {
@@ -691,12 +755,14 @@ private:
     void showInsertDialog() {
         QDialog dialog;
         dialog.setWindowTitle("Insert");
-        dialog.setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
-        dialog.setAttribute(Qt::WA_ShowWithoutActivating, false);
+        dialog.setWindowFlags(Qt::Window | Qt::WindowStaysOnTopHint |
+                              Qt::X11BypassWindowManagerHint);
+        dialog.setAttribute(Qt::WA_ShowWithoutActivating, true);
+        dialog.setContentsMargins(0, 0, 0, 0);
         dialog.setStyleSheet(QString(R"(
             QDialog {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                            stop:0 #172333, stop:0.45 #0f1825, stop:1 #0a1018);
+                padding: 0;
+                background: %2;
                 border: 1px solid #26384f;
                 border-radius: 8px;
             }
@@ -710,7 +776,7 @@ private:
             }
             QListWidget, QLineEdit {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                            stop:0 %1, stop:1 #182536);
+                                            stop:0 %1, stop:1 %1);
                 color: #ffffff;
                 border: 1px solid %2;
                 border-radius: 4px;
@@ -722,7 +788,7 @@ private:
             QListWidget::item:hover { background: #2b3a50; }
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                            stop:0 %1, stop:1 #182536);
+                                            stop:0 %1, stop:1 %1);
                 color: #ffffff;
                 border: 1px solid %2;
                 border-radius: 4px;
@@ -734,23 +800,72 @@ private:
                 border-color: #6b8db7;
             }
             QPushButton:pressed { background: #3a4c65; }
-            QPushButton#closeButton { padding: 0; }
+            QPushButton#closeButton {
+                background: #151f2d; color: #9eabbc;
+                border: 1px solid #101722; border-radius: 3px;
+                padding: 0; font: 15px "Noto Sans";
+            }
+            QPushButton#closeButton:hover { background: #a53b48; color: white; }
+            QPushButton#closeButton:pressed { background: #cf4d5d; color: white; }
         )").arg(keyColor_, borderColor_));
-        dialog.resize(620, 420);
+        settings_.beginGroup("insertWindow");
+        const QByteArray savedInsertGeometry = settings_.value("geometry").toByteArray();
+        int insertWidth = settings_.value("width", 620).toInt();
+        int insertHeight = settings_.value("height", 420).toInt();
+        const bool hasInsertPosition = settings_.contains("x") && settings_.contains("y");
+        const QPoint savedInsertPosition(settings_.value("x", 0).toInt(),
+                                         settings_.value("y", 0).toInt());
+        const QSize savedInsertSize(qMax(420, insertWidth), qMax(240, insertHeight));
+        dialog.resize(savedInsertSize);
+        settings_.endGroup();
         auto *layout = new QVBoxLayout(&dialog);
         layout->setContentsMargins(4, 4, 4, 4);
+        QPoint insertDragPointer;
+        QPoint insertDragPosition;
         auto *titleBar = new QHBoxLayout;
         titleBar->setContentsMargins(0, 0, 0, 0);
-        titleBar->addWidget(new DragBar(&dialog, [&dialog](QPoint, bool begin) {
-            if (begin && dialog.windowHandle())
-                dialog.windowHandle()->startSystemMove();
-        }, true), 1);
+        titleBar->addWidget(new DragBar(&dialog, [&dialog, &insertDragPointer,
+                                                   &insertDragPosition](QPoint pointer, bool begin) {
+            if (begin) {
+                insertDragPointer = pointer;
+                insertDragPosition = dialog.pos();
+            } else {
+                dialog.move(insertDragPosition + pointer - insertDragPointer);
+            }
+        }), 1);
         auto *close = new QPushButton("×", &dialog);
-        close->setFixedSize(22, 18);
+        close->setObjectName("closeButton");
+        close->setFixedSize(22, 14);
+        close->setStyleSheet(QString("QPushButton { background: %1; color: #eef2f7; font: bold 10px 'Noto Sans'; padding: 0; margin: 0; min-height: 0; max-height: 14px; }").arg(keyColor_));
         close->setToolTip("Close Insert window");
         titleBar->addWidget(close);
+        auto *insertBarSpacer = new QWidget(&dialog);
+        insertBarSpacer->setFixedWidth(20);
+        insertBarSpacer->setStyleSheet(QString("background: %1;").arg(keyColor_));
+        titleBar->addWidget(insertBarSpacer);
         layout->addLayout(titleBar);
-        QObject::connect(close, &QPushButton::clicked, &dialog, &QDialog::reject);
+        QObject::connect(close, &QPushButton::clicked, &dialog, [this, &dialog] {
+            const QSize size = dialog.size();
+            settings_.beginGroup("insertWindow");
+            settings_.setValue("width", size.width());
+            settings_.setValue("height", size.height());
+            settings_.setValue("x", dialog.x());
+            settings_.setValue("y", dialog.y());
+            settings_.setValue("geometry", dialog.saveGeometry());
+            settings_.endGroup();
+            settings_.sync();
+            dialog.reject();
+        });
+        QObject::connect(&dialog, &QDialog::finished, this, [this, &dialog] {
+            settings_.beginGroup("insertWindow");
+            settings_.setValue("width", dialog.width());
+            settings_.setValue("height", dialog.height());
+            settings_.setValue("x", dialog.x());
+            settings_.setValue("y", dialog.y());
+            settings_.setValue("geometry", dialog.saveGeometry());
+            settings_.endGroup();
+            settings_.sync();
+        });
         auto *columns = new QHBoxLayout;
         auto *snippetsColumn = new QVBoxLayout;
         auto *clipboardColumn = new QVBoxLayout;
@@ -774,6 +889,8 @@ private:
         editor->setPlaceholderText("New snippet text");
         editor->setFocus();
         layout->addWidget(editor);
+        auto *keepOpen = new QCheckBox("Keep open after inserting", &dialog);
+        layout->addWidget(keepOpen);
         auto *buttons = new QHBoxLayout;
         auto *add = new QPushButton("Add", &dialog);
         auto *edit = new QPushButton("Edit", &dialog);
@@ -785,6 +902,19 @@ private:
         buttons->addStretch();
         buttons->addWidget(insert);
         layout->addLayout(buttons);
+        const auto insertResize = [&dialog, this](QPoint size) {
+            dialog.resize(size.x(), size.y());
+            settings_.beginGroup("insertWindow");
+            settings_.setValue("width", dialog.width());
+            settings_.setValue("height", dialog.height());
+            settings_.setValue("geometry", dialog.saveGeometry());
+            settings_.endGroup();
+            settings_.sync();
+        };
+        new ResizeGrip(&dialog, insertResize, false, Qt::TopEdge | Qt::LeftEdge);
+        new ResizeGrip(&dialog, insertResize, false, Qt::TopEdge | Qt::RightEdge);
+        new ResizeGrip(&dialog, insertResize, false, Qt::BottomEdge | Qt::LeftEdge);
+        new ResizeGrip(&dialog, insertResize, false, Qt::BottomEdge | Qt::RightEdge);
 
         auto *snippetValues = new QStringList;
         settings_.beginGroup("snippets");
@@ -868,17 +998,45 @@ private:
                 item.start("qdbus", {"org.kde.klipper", "/klipper", "org.kde.klipper.klipper.getClipboardHistoryItem", QString::number(historyIndex)});
                 if (item.waitForFinished(1000)) value = QString::fromLocal8Bit(item.readAllStandardOutput()).trimmed();
             }
-            dialog.done(value.isEmpty() ? QDialog::Rejected : QDialog::Accepted);
             if (!value.isEmpty())
                 QTimer::singleShot(0, this, [this, value] { typeText(value); });
+            if (!keepOpen->isChecked()) {
+                const QSize size = dialog.size();
+                settings_.beginGroup("insertWindow");
+                settings_.setValue("width", size.width());
+                settings_.setValue("height", size.height());
+                settings_.setValue("geometry", dialog.saveGeometry());
+                settings_.endGroup();
+                settings_.sync();
+                dialog.done(value.isEmpty() ? QDialog::Rejected : QDialog::Accepted);
+            }
         });
         connect(snippetList, &QListWidget::itemDoubleClicked, insert,
                 [insert](QListWidgetItem *) { insert->click(); });
         connect(clipboardList, &QListWidget::itemDoubleClicked, insert,
                 [insert](QListWidgetItem *) { insert->click(); });
+        connect(&dialog, &QDialog::finished, this, [this, &dialog] {
+            const QSize size = dialog.size();
+            settings_.beginGroup("insertWindow");
+            settings_.setValue("width", size.width());
+            settings_.setValue("height", size.height());
+            settings_.setValue("x", dialog.x());
+            settings_.setValue("y", dialog.y());
+            settings_.setValue("geometry", dialog.saveGeometry());
+            settings_.endGroup();
+            settings_.sync();
+        });
+        dialog.resize(savedInsertSize);
         dialog.show();
         dialog.raise();
-        dialog.activateWindow();
+        if (hasInsertPosition)
+            dialog.move(savedInsertPosition);
+        else if (!savedInsertGeometry.isEmpty())
+            dialog.restoreGeometry(savedInsertGeometry);
+        QTimer::singleShot(0, &dialog, [&dialog, savedInsertSize] {
+            dialog.resize(savedInsertSize);
+        });
+        QTimer::singleShot(0, &dialog, [&dialog] { dialog.raise(); });
         dialog.exec();
         delete snippetValues;
     }
@@ -948,6 +1106,8 @@ private:
         settings_.setValue("opacity", opacity_);
         settings_.setValue("keyColor", keyColor_);
         settings_.setValue("borderColor", borderColor_);
+        settings_.setValue("keyLabelColor", keyLabelColor_);
+        settings_.setValue("hoverColor", hoverColor_);
         settings_.endGroup();
         settings_.sync();
     }
@@ -963,19 +1123,34 @@ private:
     void showOptions(QPushButton *menuButton) {
         auto *dialog = new QDialog;
         dialog->setAttribute(Qt::WA_DeleteOnClose);
-        dialog->setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
-        dialog->setMinimumWidth(360);
+        dialog->setWindowFlags(Qt::Window | Qt::WindowStaysOnTopHint |
+                               Qt::X11BypassWindowManagerHint);
+        dialog->setAttribute(Qt::WA_ShowWithoutActivating, true);
+        dialog->setContentsMargins(0, 0, 0, 0);
+        settings_.beginGroup("menuWindow");
+        const QByteArray menuGeometry = settings_.value("geometry").toByteArray();
+        settings_.endGroup();
+        constexpr int menuWidth = 520;
+        constexpr int menuHeight = 700;
+        dialog->setFixedSize(menuWidth, menuHeight);
         dialog->setStyleSheet(QString(R"(
-            QDialog { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                stop:0 #172333, stop:0.45 #0f1825, stop:1 #0a1018);
+            QDialog { padding: 0; background: %2;
                 color: #eef2f7; border: 1px solid #26384f; border-radius: 8px; }
-            QLabel { color: #eef2f7; }
+            QLabel { color: #eef2f7; font-size: 16px; padding-top: 10px; }
             #dragBar { background: %1; color: #607087; border: 1px solid %2;
                 border-radius: 4px; font: 9px "Noto Sans"; }
+            QPushButton#closeButton {
+                background: #151f2d; color: #9eabbc;
+                border: 1px solid #101722; border-radius: 3px;
+                padding: 0; font: 15px "Noto Sans";
+            }
+            QPushButton#closeButton:hover { background: #a53b48; color: white; }
+            QPushButton#closeButton:pressed { background: #cf4d5d; color: white; }
             QSpinBox, QSlider, QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 %1, stop:1 #182536);
-                color: #ffffff; border: 1px solid %2; border-radius: 4px; padding: 4px;
+                    stop:0 %1, stop:1 %1);
+                color: #ffffff; border: 1px solid %2; border-radius: 4px; padding: 7px 10px;
+                min-height: 34px; font-size: 15px; margin-bottom: 8px;
             }
             QPushButton:hover { background: #2b3a50; border-color: #6b8db7; }
             QPushButton:pressed { background: #3a4c65; }
@@ -983,18 +1158,38 @@ private:
             QSlider::handle:horizontal { background: #6b8db7; width: 14px; margin: -5px 0; border-radius: 7px; }
         )").arg(keyColor_, borderColor_));
         auto *outer = new QVBoxLayout(dialog);
-        outer->setContentsMargins(4, 4, 4, 4);
+        outer->setContentsMargins(0, 0, 0, 0);
+        outer->setSpacing(0);
+        auto menuDragPointer = std::make_shared<QPoint>();
+        auto menuDragPosition = std::make_shared<QPoint>();
         auto *titleBar = new QHBoxLayout;
-        titleBar->addWidget(new DragBar(dialog, [dialog](QPoint, bool begin) {
-            if (begin && dialog->windowHandle())
-                dialog->windowHandle()->startSystemMove();
-        }, true), 1);
+        titleBar->setContentsMargins(0, 0, 0, 0);
+        titleBar->setSpacing(1);
+        titleBar->addWidget(new DragBar(dialog, [dialog, menuDragPointer,
+                                                  menuDragPosition](QPoint pointer, bool begin) {
+            if (begin) {
+                *menuDragPointer = pointer;
+                *menuDragPosition = dialog->pos();
+            } else {
+                dialog->move(*menuDragPosition + pointer - *menuDragPointer);
+            }
+        }), 1);
         auto *close = new QPushButton("×", dialog);
-        close->setFixedSize(22, 18);
+        close->setObjectName("closeButton");
+        close->setFixedSize(22, 14);
+        close->setStyleSheet(QString("QPushButton { background: %1; color: #eef2f7; font: bold 10px 'Noto Sans'; padding: 0; margin: 0; min-height: 0; max-height: 14px; }").arg(keyColor_));
         titleBar->addWidget(close);
+        auto *menuBarSpacer = new QWidget(dialog);
+        menuBarSpacer->setFixedWidth(20);
+        menuBarSpacer->setStyleSheet(QString("background: %1;").arg(keyColor_));
+        titleBar->addWidget(menuBarSpacer);
         outer->addLayout(titleBar);
         QObject::connect(close, &QPushButton::clicked, dialog, &QDialog::close);
         auto *form = new QFormLayout;
+        form->setContentsMargins(30, 18, 14, 14);
+        form->setHorizontalSpacing(14);
+        form->setVerticalSpacing(36);
+        form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
         outer->addLayout(form);
 
         auto spin = [dialog](int value, int minimum, int maximum, const QString &suffix) {
@@ -1013,6 +1208,34 @@ private:
         opacity->setValue(opacity_);
         auto *keyColor = new QPushButton(keyColor_, dialog);
         auto *borderColor = new QPushButton(borderColor_, dialog);
+        auto *keyLabelColor = new QPushButton(keyLabelColor_, dialog);
+        auto *hoverColor = new QPushButton(hoverColor_, dialog);
+        const auto updateColorButton = [](QPushButton *button, const QString &color) {
+            QPixmap swatch(26, 26);
+            swatch.fill(QColor(color));
+            button->setIcon(QIcon(swatch));
+            button->setIconSize(QSize(26, 26));
+            button->setText("   " + color);
+        };
+        updateColorButton(keyColor, keyColor_);
+        updateColorButton(borderColor, borderColor_);
+        updateColorButton(keyLabelColor, keyLabelColor_);
+        updateColorButton(hoverColor, hoverColor_);
+        keyColor->setMinimumWidth(140);
+        borderColor->setMinimumWidth(140);
+        keyLabelColor->setMinimumWidth(140);
+        hoverColor->setMinimumWidth(140);
+        const auto chooseColor = [dialog](const QColor &initial, const QString &title) {
+            QColorDialog picker(initial, dialog);
+            picker.setWindowFlags(Qt::Dialog | Qt::WindowStaysOnTopHint |
+                                  Qt::X11BypassWindowManagerHint);
+            picker.setWindowModality(Qt::WindowModal);
+            picker.setWindowTitle(title);
+            picker.show();
+            picker.raise();
+            picker.activateWindow();
+            return picker.exec() == QDialog::Accepted ? picker.selectedColor() : QColor();
+        };
 
         form->addRow("Repeat delay", delay);
         form->addRow("Repeat interval", interval);
@@ -1021,6 +1244,8 @@ private:
         form->addRow("Border width", border);
         form->addRow("Key color", keyColor);
         form->addRow("Border color", borderColor);
+        form->addRow("Key label color", keyLabelColor);
+        form->addRow("Key hover color", hoverColor);
 
         connect(delay, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
             repeatDelay_ = value; refreshKeyboard(true);
@@ -1037,20 +1262,41 @@ private:
         connect(opacity, &QSlider::valueChanged, this, [this](int value) {
             opacity_ = value; refreshKeyboard();
         });
-        connect(keyColor, &QPushButton::clicked, dialog, [this, dialog, keyColor] {
-            const QColor color = QColorDialog::getColor(QColor(keyColor_), dialog, "Key color");
-            if (color.isValid()) { keyColor_ = color.name(); keyColor->setText(keyColor_); refreshKeyboard(); }
+        connect(keyColor, &QPushButton::clicked, dialog, [this, dialog, keyColor, chooseColor, updateColorButton] {
+            const QColor color = chooseColor(QColor(keyColor_), "Key color");
+            if (color.isValid()) { keyColor_ = color.name(); updateColorButton(keyColor, keyColor_); refreshKeyboard(); }
         });
-        connect(borderColor, &QPushButton::clicked, dialog, [this, dialog, borderColor] {
-            const QColor color = QColorDialog::getColor(QColor(borderColor_), dialog, "Border color");
-            if (color.isValid()) { borderColor_ = color.name(); borderColor->setText(borderColor_); refreshKeyboard(); }
+        connect(borderColor, &QPushButton::clicked, dialog, [this, dialog, borderColor, chooseColor, updateColorButton] {
+            const QColor color = chooseColor(QColor(borderColor_), "Border color");
+            if (color.isValid()) { borderColor_ = color.name(); updateColorButton(borderColor, borderColor_); refreshKeyboard(); }
+        });
+        connect(keyLabelColor, &QPushButton::clicked, dialog, [this, dialog, keyLabelColor, chooseColor, updateColorButton] {
+            const QColor color = chooseColor(QColor(keyLabelColor_), "Key label color");
+            if (color.isValid()) { keyLabelColor_ = color.name(); updateColorButton(keyLabelColor, keyLabelColor_); refreshKeyboard(); }
+        });
+        connect(hoverColor, &QPushButton::clicked, dialog, [this, dialog, hoverColor, chooseColor, updateColorButton] {
+            const QColor color = chooseColor(QColor(hoverColor_), "Key hover color");
+            if (color.isValid()) { hoverColor_ = color.name(); updateColorButton(hoverColor, hoverColor_); refreshKeyboard(); }
         });
 
-        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
-        connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
-        form->addRow(buttons);
-        connect(dialog, &QDialog::destroyed, this, [menuButton] { menuButton->setEnabled(true); });
+        if (!menuGeometry.isEmpty())
+            dialog->restoreGeometry(menuGeometry);
+        connect(dialog, &QDialog::finished, this, [this, dialog] {
+            settings_.beginGroup("menuWindow");
+            settings_.setValue("width", dialog->width());
+            settings_.setValue("height", dialog->height());
+            settings_.setValue("geometry", dialog->saveGeometry());
+            settings_.endGroup();
+            settings_.sync();
+        });
+        connect(dialog, &QDialog::destroyed, menuButton, [menuButton] {
+            if (menuButton)
+                menuButton->setEnabled(true);
+        });
         dialog->show();
+        dialog->raise();
+        QTimer::singleShot(0, dialog, [dialog] { dialog->raise(); });
+        QTimer::singleShot(0, dialog, [dialog] { dialog->raise(); });
     }
 
     void applyStyle() {
@@ -1070,34 +1316,38 @@ private:
                 font: 9px "Noto Sans";
             }
             #closeButton {
-                background: #151f2d;
-                color: #9eabbc;
-                border: 1px solid #101722;
+                background: %1;
+                color: %4;
+                border: %2px solid %3;
                 border-radius: 3px;
                 padding: 0;
                 font: 12px "Noto Sans";
             }
             #closeButton:hover { background: #a53b48; color: white; }
             #closeButton:pressed { background: #cf4d5d; color: white; }
+            #monitorButton, #minimizeButton, #topBarSpacer {
+                background: %1;
+                border: %2px solid %3;
+                color: %4;
+            }
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                            stop:0 %1, stop:1 #182536);
-                color: #eef2f7;
+                                            stop:0 %1, stop:1 %7);
+                color: %4;
                 border: %2px solid %3;
                 border-radius: 4px;
                 padding: 0px 2px;
                 font: 14px "Noto Sans";
             }
             QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                            stop:0 #3a506d, stop:1 #263a54);
+                background: %5;
                 border-color: #6b8db7;
             }
             QPushButton:pressed {
-                background: #3a4c65;
+                background: %6;
                 padding-top: 2px;
             }
-            QPushButton[special="true"] { color: #d8e0ea; font-size: 12px; }
+            QPushButton[special="true"] { color: %4; font-size: 12px; }
             QPushButton[clipboardAction="CUT"],
             QPushButton[clipboardAction="COPY"],
             QPushButton[clipboardAction="PASTE"] { font-size: 18px; }
@@ -1112,7 +1362,9 @@ private:
                 color: white;
                 border-color: #f0808d;
             }
-        )").arg(keyColor_).arg(borderWidth_).arg(borderColor_);
+        )").arg(keyColor_).arg(borderWidth_).arg(borderColor_).arg(keyLabelColor_)
+             .arg(hoverColor_).arg(QColor(keyColor_).darker(145).name())
+             .arg(QColor(keyColor_).darker(165).name());
         setStyleSheet(style);
         opacityEffect_->setOpacity(opacity_ / 100.0);
     }
@@ -1122,7 +1374,7 @@ int main(int argc, char **argv) {
     QApplication app(argc, argv);
     app.setApplicationName("orbit-osk");
     app.setOrganizationName("Orbit");
-    app.setQuitOnLastWindowClosed(true);
+    app.setQuitOnLastWindowClosed(false);
     Keyboard keyboard;
     keyboard.show();
     return app.exec();
