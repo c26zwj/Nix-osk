@@ -5,6 +5,8 @@
 #include <QCursor>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QEventLoop>
+#include <QDir>
 #include <QFormLayout>
 #include <QGraphicsOpacityEffect>
 #include <QGuiApplication>
@@ -12,27 +14,35 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QLockFile>
 #include <QMap>
 #include <QMouseEvent>
 #include <QProcess>
+#include <QPointer>
 #include <QPushButton>
 #include <QPlainTextEdit>
 #include <QRegularExpression>
 #include <QRegion>
 #include <QScreen>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QShowEvent>
 #include <QSlider>
 #include <QSizeGrip>
 #include <QSpinBox>
 #include <QStyle>
 #include <QSystemTrayIcon>
+#include <QToolTip>
+#include <QThread>
 #include <QMenu>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <LayerShellQt/Window>
 #include <functional>
+#include <cerrno>
+#include <csignal>
+#include <unistd.h>
 
 class DragBar final : public QLabel {
 public:
@@ -220,6 +230,34 @@ private:
     std::function<void()> rightClickAction_;
     bool modifier_ = false;
     int flashGeneration_ = 0;
+};
+
+class FocusLineEdit final : public QLineEdit {
+public:
+    explicit FocusLineEdit(QWidget *parent, std::function<void(QLineEdit *)> clicked,
+                           std::function<void()> focusLost = {})
+        : QLineEdit(parent), clicked_(std::move(clicked)), focusLost_(std::move(focusLost)) {}
+
+protected:
+    void mousePressEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton) {
+            if (clicked_)
+                clicked_(this);
+            window()->activateWindow();
+            setFocus(Qt::MouseFocusReason);
+        }
+        QLineEdit::mousePressEvent(event);
+    }
+
+    void focusOutEvent(QFocusEvent *event) override {
+        QLineEdit::focusOutEvent(event);
+        if (focusLost_)
+            focusLost_();
+    }
+
+private:
+    std::function<void(QLineEdit *)> clicked_;
+    std::function<void()> focusLost_;
 };
 
 class Keyboard final : public QWidget {
@@ -432,6 +470,7 @@ private:
     QHBoxLayout *body_{};
     QWidget *panel_{};
     QList<ResizeGrip *> resizeGrips_;
+    QPointer<QLineEdit> activeEditor_;
     QGraphicsOpacityEffect *opacityEffect_{};
     QSystemTrayIcon *tray_{};
     LayerShellQt::Window *layer_{};
@@ -741,6 +780,11 @@ private:
             {"z","44"},{"x","45"},{"c","46"},{"v","47"},{"b","48"},{"n","49"},{"m","50"},
             {",","51"},{".","52"},{"/","53"},{"<","86"}
         };
+        if (activeEditor_) {
+            typeText(forceShift || shiftActive() ? shiftedText(label) : label);
+            clearModifiers();
+            return;
+        }
         if (codes.contains(label))
             sendChord(codes[label], forceShift || shiftActive());
         else
@@ -749,16 +793,30 @@ private:
     }
 
     void typeText(const QString &text) {
-        runYdotool({"type", "--key-delay", "0", "--", text});
+        if (activeEditor_) {
+            activeEditor_->insert(text);
+            return;
+        }
+        // Use zero inter-key and key-hold delays for maximum typing speed.
+        runYdotool({"type", "--key-delay", "0", "--key-hold", "0", "--", text});
     }
 
     void showInsertDialog() {
+        QPointer<QWindow> previousFocusWindow = QGuiApplication::focusWindow();
         QDialog dialog;
         dialog.setWindowTitle("Insert");
+        // Let the window manager handle activation and focus handoff to other
+        // applications. Override-redirect windows bypass that coordination.
         dialog.setWindowFlags(Qt::Window | Qt::WindowStaysOnTopHint |
-                              Qt::X11BypassWindowManagerHint);
+                              Qt::FramelessWindowHint);
         dialog.setAttribute(Qt::WA_ShowWithoutActivating, true);
+        dialog.setFocusPolicy(Qt::StrongFocus);
         dialog.setContentsMargins(0, 0, 0, 0);
+        connect(qApp, &QGuiApplication::focusWindowChanged, &dialog,
+                [this, &dialog](QWindow *window) {
+                    if (window != dialog.windowHandle())
+                        activeEditor_ = nullptr;
+                });
         dialog.setStyleSheet(QString(R"(
             QDialog {
                 padding: 0;
@@ -800,6 +858,11 @@ private:
                 border-color: #6b8db7;
             }
             QPushButton:pressed { background: #3a4c65; }
+            QPushButton:disabled {
+                background: #101722;
+                color: #667386;
+                border-color: #1a2635;
+            }
             QPushButton#closeButton {
                 background: #151f2d; color: #9eabbc;
                 border: 1px solid #101722; border-radius: 3px;
@@ -871,33 +934,56 @@ private:
         auto *clipboardColumn = new QVBoxLayout;
         snippetsColumn->addWidget(new QLabel("Snippets", &dialog));
         clipboardColumn->addWidget(new QLabel("Clipboard", &dialog));
-        auto *snippetFilter = new QLineEdit(&dialog);
-        auto *clipboardFilter = new QLineEdit(&dialog);
+        auto filterClicked = [this](QLineEdit *field) {
+            activeEditor_ = field;
+        };
+        auto filterFocusLost = [this] {
+            activeEditor_ = nullptr;
+        };
+        auto *snippetFilter = new FocusLineEdit(&dialog, filterClicked, filterFocusLost);
+        auto *clipboardFilter = new FocusLineEdit(&dialog, filterClicked, filterFocusLost);
         snippetFilter->setPlaceholderText("Filter snippets");
         clipboardFilter->setPlaceholderText("Filter clipboard");
         snippetsColumn->addWidget(snippetFilter);
         clipboardColumn->addWidget(clipboardFilter);
         auto *snippetList = new QListWidget(&dialog);
         auto *clipboardList = new QListWidget(&dialog);
+        for (auto *list : {snippetList, clipboardList}) {
+            list->setWordWrap(false);
+            list->setTextElideMode(Qt::ElideRight);
+            list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+            list->setAttribute(Qt::WA_AlwaysShowToolTips, true);
+        }
+        const auto preview = [](const QString &value) {
+            return value.size() > 34 ? value.left(31) + QStringLiteral("…") : value;
+        };
         snippetsColumn->addWidget(snippetList);
         clipboardColumn->addWidget(clipboardList);
         columns->addLayout(snippetsColumn);
         columns->addLayout(clipboardColumn);
         layout->addLayout(columns);
 
-        auto *editor = new QLineEdit(&dialog);
+        auto *editor = new FocusLineEdit(&dialog, filterClicked, filterFocusLost);
         editor->setPlaceholderText("New snippet text");
-        editor->setFocus();
-        layout->addWidget(editor);
+        auto *editorRow = new QHBoxLayout;
+        auto *edit = new QPushButton("Update", &dialog);
+        edit->setToolTip("Update the selected snippet with this text");
+        editorRow->addWidget(editor, 1);
+        editorRow->addWidget(edit);
+        layout->addLayout(editorRow);
         auto *keepOpen = new QCheckBox("Keep open after inserting", &dialog);
         layout->addWidget(keepOpen);
         auto *buttons = new QHBoxLayout;
         auto *add = new QPushButton("Add", &dialog);
-        auto *edit = new QPushButton("Edit", &dialog);
+        auto *cancel = new QPushButton("Cancel", &dialog);
         auto *remove = new QPushButton("Remove", &dialog);
         auto *insert = new QPushButton("Insert", &dialog);
+        add->setEnabled(false);
+        cancel->setEnabled(false);
+        edit->setEnabled(false);
+        remove->setEnabled(false);
         buttons->addWidget(add);
-        buttons->addWidget(edit);
+        buttons->addWidget(cancel);
         buttons->addWidget(remove);
         buttons->addStretch();
         buttons->addWidget(insert);
@@ -921,7 +1007,7 @@ private:
         *snippetValues = settings_.value("items").toStringList();
         settings_.endGroup();
         for (const auto &snippet : *snippetValues) {
-            auto *item = new QListWidgetItem(snippet.left(80), snippetList);
+            auto *item = new QListWidgetItem(preview(snippet), snippetList);
             item->setToolTip(snippet);
         }
 
@@ -947,7 +1033,7 @@ private:
                 if (value.startsWith(QStringLiteral("▨")) ||
                     value.contains(QRegularExpression(QStringLiteral("^\\d+x\\d+$"))))
                     continue;
-                auto *item = new QListWidgetItem(value.left(80), clipboardList);
+                auto *item = new QListWidgetItem(preview(value), clipboardList);
                 item->setData(Qt::UserRole, i);
                 item->setToolTip(value);
             }
@@ -963,22 +1049,70 @@ private:
         };
         filterList(snippetFilter, snippetList);
         filterList(clipboardFilter, clipboardList);
+        for (auto *list : {snippetList, clipboardList}) {
+            list->setMouseTracking(true);
+            connect(list, &QListWidget::itemEntered, &dialog,
+                    [list](QListWidgetItem *item) {
+                        if (item && !item->toolTip().isEmpty())
+                            QToolTip::showText(QCursor::pos(), item->toolTip(), list);
+                    });
+        }
 
         connect(snippetList, &QListWidget::currentRowChanged, &dialog, [editor, snippetValues](int row) {
             if (row >= 0 && row < snippetValues->size()) editor->setText(snippetValues->at(row));
         });
-        connect(add, &QPushButton::clicked, &dialog, [snippetList, editor, snippetValues, this] {
+        connect(snippetList, &QListWidget::currentRowChanged, &dialog,
+                [clipboardList](int row) {
+                    if (row >= 0 && clipboardList->currentRow() >= 0)
+                        clipboardList->setCurrentRow(-1);
+                });
+        connect(clipboardList, &QListWidget::currentRowChanged, &dialog,
+                [snippetList](int row) {
+                    if (row >= 0 && snippetList->currentRow() >= 0)
+                        snippetList->setCurrentRow(-1);
+                });
+        connect(add, &QPushButton::clicked, &dialog, [&dialog, snippetList, editor, snippetValues, this, preview, previousFocusWindow] {
             if (editor->text().isEmpty()) return;
             snippetValues->append(editor->text());
-            auto *item = new QListWidgetItem(editor->text().left(80), snippetList);
+            auto *item = new QListWidgetItem(preview(editor->text()), snippetList);
             item->setToolTip(editor->text());
             settings_.beginGroup("snippets"); settings_.setValue("items", *snippetValues); settings_.endGroup();
+            editor->clear();
+            activeEditor_ = nullptr;
+            if (previousFocusWindow)
+                previousFocusWindow->requestActivate();
         });
-        connect(edit, &QPushButton::clicked, &dialog, [snippetList, editor, snippetValues, this] {
+        QPointer<QPushButton> addButton = add;
+        QPointer<QPushButton> cancelButton = cancel;
+        connect(editor, &QLineEdit::textChanged, &dialog,
+                [addButton, cancelButton](const QString &text) {
+                    const bool hasText = !text.trimmed().isEmpty();
+                    QTimer::singleShot(0, [addButton, cancelButton, hasText] {
+                        if (addButton) addButton->setEnabled(hasText);
+                        if (cancelButton) cancelButton->setEnabled(hasText);
+                    });
+                });
+        const auto refreshUpdate = [edit, editor, snippetList] {
+            edit->setEnabled(snippetList->currentRow() >= 0 &&
+                             !editor->text().trimmed().isEmpty());
+        };
+        connect(editor, &QLineEdit::textChanged, &dialog, refreshUpdate);
+        connect(snippetList, &QListWidget::currentRowChanged, &dialog, refreshUpdate);
+        connect(cancel, &QPushButton::clicked, &dialog,
+                [cancel, editor, this, previousFocusWindow] {
+                    editor->clear();
+                    cancel->setEnabled(false);
+                    activeEditor_ = nullptr;
+                    if (previousFocusWindow)
+                        previousFocusWindow->requestActivate();
+        });
+        connect(snippetList, &QListWidget::currentRowChanged, &dialog,
+                [remove](int row) { remove->setEnabled(row >= 0); });
+        connect(edit, &QPushButton::clicked, &dialog, [snippetList, editor, snippetValues, this, preview] {
             const int row = snippetList->currentRow();
             if (row < 0 || row >= snippetValues->size() || editor->text().isEmpty()) return;
             (*snippetValues)[row] = editor->text();
-            snippetList->item(row)->setText(editor->text().left(80));
+            snippetList->item(row)->setText(preview(editor->text()));
             snippetList->item(row)->setToolTip(editor->text());
             settings_.beginGroup("snippets"); settings_.setValue("items", *snippetValues); settings_.endGroup();
         });
@@ -1026,6 +1160,11 @@ private:
             settings_.endGroup();
             settings_.sync();
         });
+        connect(&dialog, &QDialog::finished, this, [this, previousFocusWindow] {
+            activeEditor_ = nullptr;
+            if (previousFocusWindow)
+                previousFocusWindow->requestActivate();
+        });
         dialog.resize(savedInsertSize);
         dialog.show();
         dialog.raise();
@@ -1037,7 +1176,14 @@ private:
             dialog.resize(savedInsertSize);
         });
         QTimer::singleShot(0, &dialog, [&dialog] { dialog.raise(); });
-        dialog.exec();
+        // Keep the stack-owned dialog alive while allowing the user to click
+        // the underlying application and change its focus.
+        dialog.setWindowModality(Qt::NonModal);
+        dialog.show();
+        dialog.setFocus();
+        QEventLoop insertLoop;
+        connect(&dialog, &QDialog::finished, &insertLoop, &QEventLoop::quit);
+        insertLoop.exec();
         delete snippetValues;
     }
 
@@ -1051,6 +1197,11 @@ private:
             {"MENU","127"},{"UP","103"},{"DOWN","108"},{"LEFT","105"},{"RIGHT","106"},
             {"HOME","102"},{"END","107"},{"DELETE","111"},{"SPACE","57"}
         };
+        if (activeEditor_ && name == QStringLiteral("SPACE")) {
+            activeEditor_->insert(QStringLiteral(" "));
+            clearModifiers();
+            return;
+        }
         if (codes.contains(name))
             sendChord(codes[name], shiftActive());
         clearModifiers();
@@ -1375,6 +1526,30 @@ int main(int argc, char **argv) {
     app.setApplicationName("orbit-osk");
     app.setOrganizationName("Orbit");
     app.setQuitOnLastWindowClosed(false);
+    const QString runtimeDir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    const QString lockPath = (runtimeDir.isEmpty() ? QDir::tempPath() : runtimeDir)
+                             + "/orbit-osk.lock";
+    QLockFile instanceLock(lockPath);
+    instanceLock.setStaleLockTime(0);
+    if (!instanceLock.tryLock(100)) {
+        qint64 previousPid = 0;
+        QString previousHost;
+        QString previousApp;
+
+        // Replace an existing local instance when launched again. Only use
+        // the PID recorded by our lock file; never scan or kill by name.
+        if (instanceLock.getLockInfo(&previousPid, &previousHost, &previousApp) &&
+            previousApp == QStringLiteral("orbit-osk") && previousPid > 0 &&
+            previousPid != static_cast<qint64>(getpid())) {
+            if (kill(static_cast<pid_t>(previousPid), SIGTERM) == 0 || errno == ESRCH) {
+                for (int i = 0; i < 20 && !instanceLock.tryLock(50); ++i)
+                    QThread::msleep(50);
+            }
+        }
+
+        if (!instanceLock.isLocked() && !instanceLock.tryLock(100))
+            return 0;
+    }
     Keyboard keyboard;
     keyboard.show();
     return app.exec();
