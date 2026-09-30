@@ -5,7 +5,6 @@
 #include <QCursor>
 #include <QDialog>
 #include <QDialogButtonBox>
-#include <QEventLoop>
 #include <QDir>
 #include <QFormLayout>
 #include <QGraphicsOpacityEffect>
@@ -427,10 +426,32 @@ public:
         setWindowState(Qt::WindowNoState);
         showNormal();
         resize(panel_->size());
-        if (restorePanelPosition_)
-            move(savedPanelPosition_);
-        else if (QScreen *screen = QGuiApplication::primaryScreen())
-            move(screen->geometry().center() - rect().center());
+        QScreen *placementScreen = nullptr;
+        if (restorePanelPosition_) {
+            for (QScreen *screen : QGuiApplication::screens()) {
+                if (screen->availableGeometry().contains(savedPanelPosition_)) {
+                    placementScreen = screen;
+                    break;
+                }
+            }
+        }
+        if (!placementScreen)
+            placementScreen = QGuiApplication::primaryScreen();
+        if (placementScreen) {
+            const QRect area = placementScreen->availableGeometry();
+            const QPoint desired = restorePanelPosition_
+                                       ? savedPanelPosition_
+                                       : area.center() - rect().center();
+            move(qBound(area.left(), desired.x(),
+                        qMax(area.left(), area.right() - width() + 1)),
+                 qBound(area.top(), desired.y(),
+                        qMax(area.top(), area.bottom() - height() + 1)));
+        }
+        QTimer::singleShot(0, this, [this] {
+            showInsertDialog(true);
+            showNormal();
+            raise();
+        });
     }
 
 protected:
@@ -471,6 +492,12 @@ private:
     QWidget *panel_{};
     QList<ResizeGrip *> resizeGrips_;
     QPointer<QLineEdit> activeEditor_;
+    QDialog insertDialog_;
+    QPointer<QWindow> insertTargetWindow_;
+    bool insertDialogInitialized_ = false;
+    QPoint insertDragPointer_;
+    QPoint insertDragPosition_;
+    QStringList snippetValues_;
     QGraphicsOpacityEffect *opacityEffect_{};
     QSystemTrayIcon *tray_{};
     LayerShellQt::Window *layer_{};
@@ -801,9 +828,18 @@ private:
         runYdotool({"type", "--key-delay", "0", "--key-hold", "0", "--", text});
     }
 
-    void showInsertDialog() {
-        QPointer<QWindow> previousFocusWindow = QGuiApplication::focusWindow();
-        QDialog dialog;
+    void showInsertDialog(bool preload = false) {
+        insertTargetWindow_ = QGuiApplication::focusWindow();
+        if (insertDialogInitialized_) {
+            if (!preload) {
+                insertDialog_.setAttribute(Qt::WA_ShowWithoutActivating, false);
+                insertDialog_.show();
+                insertDialog_.raise();
+                insertDialog_.activateWindow();
+            }
+            return;
+        }
+        QDialog &dialog = insertDialog_;
         dialog.setWindowTitle("Insert");
         // Let the window manager handle activation and focus handoff to other
         // applications. Override-redirect windows bypass that coordination.
@@ -883,17 +919,14 @@ private:
         settings_.endGroup();
         auto *layout = new QVBoxLayout(&dialog);
         layout->setContentsMargins(4, 4, 4, 4);
-        QPoint insertDragPointer;
-        QPoint insertDragPosition;
         auto *titleBar = new QHBoxLayout;
         titleBar->setContentsMargins(0, 0, 0, 0);
-        titleBar->addWidget(new DragBar(&dialog, [&dialog, &insertDragPointer,
-                                                   &insertDragPosition](QPoint pointer, bool begin) {
+        titleBar->addWidget(new DragBar(&dialog, [this, &dialog](QPoint pointer, bool begin) {
             if (begin) {
-                insertDragPointer = pointer;
-                insertDragPosition = dialog.pos();
+                insertDragPointer_ = pointer;
+                insertDragPosition_ = dialog.pos();
             } else {
-                dialog.move(insertDragPosition + pointer - insertDragPointer);
+                dialog.move(insertDragPosition_ + pointer - insertDragPointer_);
             }
         }), 1);
         auto *close = new QPushButton("×", &dialog);
@@ -1002,7 +1035,7 @@ private:
         new ResizeGrip(&dialog, insertResize, false, Qt::BottomEdge | Qt::LeftEdge);
         new ResizeGrip(&dialog, insertResize, false, Qt::BottomEdge | Qt::RightEdge);
 
-        auto *snippetValues = new QStringList;
+        auto *snippetValues = &snippetValues_;
         settings_.beginGroup("snippets");
         *snippetValues = settings_.value("items").toStringList();
         settings_.endGroup();
@@ -1011,33 +1044,33 @@ private:
             item->setToolTip(snippet);
         }
 
-        QProcess klipper;
-        klipper.start("qdbus", {"org.kde.klipper", "/klipper",
-                                 "org.kde.klipper.klipper.getClipboardHistoryMenu"});
-        if (klipper.waitForFinished(1000)) {
+        auto loadClipboardHistory = [clipboardList, preview] {
+            QProcess klipper;
+            klipper.start("qdbus", {"org.kde.klipper", "/klipper",
+                                     "org.kde.klipper.klipper.getClipboardHistoryMenu"});
+            if (!klipper.waitForFinished(1000))
+                return;
             const auto history = QString::fromLocal8Bit(klipper.readAllStandardOutput())
                                      .split('\n', Qt::SkipEmptyParts);
-            for (int i = 0; i < history.size(); ++i) {
+            for (const QString &historyEntry : history) {
                 // Klipper represents image entries as labels such as "▨ 303x537".
                 // They are not text clipboard entries and must not be shown here.
-                if (history[i].contains(QRegularExpression(QStringLiteral("(^|\\s)\\d+x\\d+(\\s|$)"))) ||
-                    history[i].startsWith(QStringLiteral("▨")))
+                if (historyEntry.contains(QRegularExpression(QStringLiteral("(^|\\s)\\d+x\\d+(\\s|$)"))) ||
+                    historyEntry.startsWith(QStringLiteral("▨")))
                     continue;
-                QProcess itemQuery;
-                itemQuery.start("qdbus", {"org.kde.klipper", "/klipper",
-                                           "org.kde.klipper.klipper.getClipboardHistoryItem",
-                                           QString::number(i)});
-                if (!itemQuery.waitForFinished(1000)) continue;
-                const QString value = QString::fromLocal8Bit(itemQuery.readAllStandardOutput()).trimmed();
+                const QString value = historyEntry.trimmed();
                 if (value.isEmpty()) continue;
                 if (value.startsWith(QStringLiteral("▨")) ||
                     value.contains(QRegularExpression(QStringLiteral("^\\d+x\\d+$"))))
                     continue;
                 auto *item = new QListWidgetItem(preview(value), clipboardList);
-                item->setData(Qt::UserRole, i);
                 item->setToolTip(value);
             }
-        }
+        };
+        if (preload)
+            QTimer::singleShot(1000, &dialog, loadClipboardHistory);
+        else
+            loadClipboardHistory();
 
         auto filterList = [](QLineEdit *filter, QListWidget *list) {
             QObject::connect(filter, &QLineEdit::textChanged, list, [filter, list] {
@@ -1071,7 +1104,7 @@ private:
                     if (row >= 0 && snippetList->currentRow() >= 0)
                         snippetList->setCurrentRow(-1);
                 });
-        connect(add, &QPushButton::clicked, &dialog, [&dialog, snippetList, editor, snippetValues, this, preview, previousFocusWindow] {
+        connect(add, &QPushButton::clicked, &dialog, [&dialog, snippetList, editor, snippetValues, this, preview] {
             if (editor->text().isEmpty()) return;
             snippetValues->append(editor->text());
             auto *item = new QListWidgetItem(preview(editor->text()), snippetList);
@@ -1079,8 +1112,8 @@ private:
             settings_.beginGroup("snippets"); settings_.setValue("items", *snippetValues); settings_.endGroup();
             editor->clear();
             activeEditor_ = nullptr;
-            if (previousFocusWindow)
-                previousFocusWindow->requestActivate();
+            if (insertTargetWindow_)
+                insertTargetWindow_->requestActivate();
         });
         QPointer<QPushButton> addButton = add;
         QPointer<QPushButton> cancelButton = cancel;
@@ -1099,12 +1132,12 @@ private:
         connect(editor, &QLineEdit::textChanged, &dialog, refreshUpdate);
         connect(snippetList, &QListWidget::currentRowChanged, &dialog, refreshUpdate);
         connect(cancel, &QPushButton::clicked, &dialog,
-                [cancel, editor, this, previousFocusWindow] {
+                [cancel, editor, this] {
                     editor->clear();
                     cancel->setEnabled(false);
                     activeEditor_ = nullptr;
-                    if (previousFocusWindow)
-                        previousFocusWindow->requestActivate();
+                    if (insertTargetWindow_)
+                        insertTargetWindow_->requestActivate();
         });
         connect(snippetList, &QListWidget::currentRowChanged, &dialog,
                 [remove](int row) { remove->setEnabled(row >= 0); });
@@ -1122,18 +1155,21 @@ private:
             snippetValues->removeAt(row); delete snippetList->takeItem(row);
             settings_.beginGroup("snippets"); settings_.setValue("items", *snippetValues); settings_.endGroup();
         });
-        connect(insert, &QPushButton::clicked, &dialog, [&] {
+        connect(insert, &QPushButton::clicked, &dialog,
+                [this, &dialog, snippetList, clipboardList, snippetValues, keepOpen] {
             QString value;
             if (snippetList->currentRow() >= 0)
                 value = snippetValues->at(snippetList->currentRow());
             else if (clipboardList->currentRow() >= 0) {
-                QProcess item;
-                const int historyIndex = clipboardList->currentItem()->data(Qt::UserRole).toInt();
-                item.start("qdbus", {"org.kde.klipper", "/klipper", "org.kde.klipper.klipper.getClipboardHistoryItem", QString::number(historyIndex)});
-                if (item.waitForFinished(1000)) value = QString::fromLocal8Bit(item.readAllStandardOutput()).trimmed();
+                // Keep the value captured when the list was built. Klipper's
+                // history indices can shift while the filtered dialog stays open.
+                value = clipboardList->currentItem()->toolTip();
             }
-            if (!value.isEmpty())
+            if (!value.isEmpty()) {
+                if (insertTargetWindow_)
+                    insertTargetWindow_->requestActivate();
                 QTimer::singleShot(0, this, [this, value] { typeText(value); });
+            }
             if (!keepOpen->isChecked()) {
                 const QSize size = dialog.size();
                 settings_.beginGroup("insertWindow");
@@ -1160,31 +1196,22 @@ private:
             settings_.endGroup();
             settings_.sync();
         });
-        connect(&dialog, &QDialog::finished, this, [this, previousFocusWindow] {
+        connect(&dialog, &QDialog::finished, this, [this] {
             activeEditor_ = nullptr;
-            if (previousFocusWindow)
-                previousFocusWindow->requestActivate();
+            if (insertTargetWindow_)
+                insertTargetWindow_->requestActivate();
         });
         dialog.resize(savedInsertSize);
-        dialog.show();
-        dialog.raise();
         if (hasInsertPosition)
             dialog.move(savedInsertPosition);
         else if (!savedInsertGeometry.isEmpty())
             dialog.restoreGeometry(savedInsertGeometry);
-        QTimer::singleShot(0, &dialog, [&dialog, savedInsertSize] {
-            dialog.resize(savedInsertSize);
-        });
-        QTimer::singleShot(0, &dialog, [&dialog] { dialog.raise(); });
-        // Keep the stack-owned dialog alive while allowing the user to click
-        // the underlying application and change its focus.
         dialog.setWindowModality(Qt::NonModal);
-        dialog.show();
-        dialog.setFocus();
-        QEventLoop insertLoop;
-        connect(&dialog, &QDialog::finished, &insertLoop, &QEventLoop::quit);
-        insertLoop.exec();
-        delete snippetValues;
+        insertDialogInitialized_ = true;
+        if (!preload) {
+            dialog.show();
+            dialog.raise();
+        }
     }
 
     void pressKey(const QString &name) {
